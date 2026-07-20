@@ -109,6 +109,7 @@ func purgeExpiredCaches() {
 		return true
 	})
 	purgeExpiredCodexReasoningReplayCache(now)
+	purgeExpiredCodexCompactionCache(now)
 	purgeExpiredXAIReasoningReplayCache(now)
 	purgeExpiredAntigravityReasoningReplayCache(now)
 }

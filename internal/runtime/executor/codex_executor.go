@@ -1152,6 +1152,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if errReplay != nil {
 		return resp, errReplay
 	}
+	body = e.applyCodexServerCompaction(ctx, auth, from, req, opts, baseModel, body)
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -1201,6 +1202,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		if e.shouldRetryWithCodexServerCompaction(ctx, from, opts, httpResp.StatusCode, b) {
+			helps.LogWithRequestID(ctx).Infof("codex executor: context window exceeded, retrying once with forced server-side compaction")
+			return e.Execute(codexWithForcedCompaction(ctx), auth, req, opts)
+		}
 		err = newCodexStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
@@ -1393,6 +1398,204 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	return resp, nil
 }
 
+const (
+	// codexCompactionDefaultContextWindow is used when neither the config nor
+	// the model registry knows the context window for a Codex model.
+	codexCompactionDefaultContextWindow = 258_000
+	// codexCompactionThresholdPercent mirrors the Codex CLI auto-compact limit
+	// (90% of the context window) with extra margin for estimation error.
+	codexCompactionThresholdPercent = 85
+)
+
+// codexForcedCompactionKey marks a retry attempt that must compact regardless
+// of the estimated input size. It also guards against retry recursion.
+type codexForcedCompactionKey struct{}
+
+func codexWithForcedCompaction(ctx context.Context) context.Context {
+	return context.WithValue(ctx, codexForcedCompactionKey{}, true)
+}
+
+func codexCompactionForced(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	forced, _ := ctx.Value(codexForcedCompactionKey{}).(bool)
+	return forced
+}
+
+// codexServerCompactionEnabled reports whether transparent server-side
+// compaction applies to this request. Native Responses clients (Codex CLI)
+// drive compaction themselves via compaction_trigger items, so only translated
+// sources are handled here.
+func codexServerCompactionEnabled(cfg *config.Config, from sdktranslator.Format, opts cliproxyexecutor.Options) bool {
+	if cfg != nil && cfg.Codex.Compaction.Disabled {
+		return false
+	}
+	if opts.Alt == "responses/compact" {
+		return false
+	}
+	return !sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse)
+}
+
+func codexCompactionTriggerTokens(cfg *config.Config, baseModel string) int64 {
+	var compactionCfg config.CodexCompactionConfig
+	if cfg != nil {
+		compactionCfg = cfg.Codex.Compaction
+	}
+	if compactionCfg.TriggerTokens > 0 {
+		return int64(compactionCfg.TriggerTokens)
+	}
+	contextWindow := int64(compactionCfg.ContextWindow)
+	if contextWindow <= 0 {
+		if info := registry.LookupModelInfo(baseModel, "codex"); info != nil && info.ContextLength > 0 {
+			contextWindow = int64(info.ContextLength)
+		}
+	}
+	if contextWindow <= 0 {
+		contextWindow = codexCompactionDefaultContextWindow
+	}
+	return contextWindow * codexCompactionThresholdPercent / 100
+}
+
+func estimateCodexCompactionTokens(baseModel string, body []byte) int64 {
+	enc, err := tokenizerForCodexModel(baseModel)
+	if err != nil {
+		return 0
+	}
+	count, err := countCodexInputTokens(enc, body)
+	if err != nil {
+		return 0
+	}
+	return count + helps.EstimateCodexEncryptedContentTokens(body)
+}
+
+// shouldRetryWithCodexServerCompaction reports whether an upstream error is a
+// context-window overflow that a forced compaction retry can resolve.
+func (e *CodexExecutor) shouldRetryWithCodexServerCompaction(ctx context.Context, from sdktranslator.Format, opts cliproxyexecutor.Options, statusCode int, body []byte) bool {
+	if codexCompactionForced(ctx) || !codexServerCompactionEnabled(e.cfg, from, opts) {
+		return false
+	}
+	code, _, ok := codexStatusErrorClassification(statusCode, body)
+	return ok && code == "context_too_large"
+}
+
+// applyCodexServerCompaction keeps translated Codex input inside the model
+// context window. It substitutes previously compacted history for the current
+// session and, when the estimated input size crosses the compaction threshold
+// (or a context-overflow retry forces it), calls the upstream
+// /responses/compact endpoint and replaces the input with the compacted
+// history it returns. Failures are logged and the input is sent unchanged.
+func (e *CodexExecutor) applyCodexServerCompaction(ctx context.Context, auth *cliproxyauth.Auth, from sdktranslator.Format, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string, body []byte) []byte {
+	if !codexServerCompactionEnabled(e.cfg, from, opts) {
+		return body
+	}
+	items := helps.CodexInputItemsRaw(body)
+	if len(items) == 0 {
+		return body
+	}
+	sessionKey := codexReasoningReplaySessionKey(ctx, from, req, opts, body)
+	originalHashes := make([]string, 0, len(items))
+	for _, item := range items {
+		originalHashes = append(originalHashes, internalcache.HashCodexCompactionItem(item))
+	}
+	if sessionKey != "" {
+		if checkpoint, ok := internalcache.MatchCodexCompactionCheckpoint(baseModel, sessionKey, originalHashes); ok {
+			if substituted, okSub := helps.ReplaceCodexInputPrefix(body, checkpoint.Replacement, len(checkpoint.PrefixHashes)); okSub {
+				body = substituted
+				helps.LogWithRequestID(ctx).Debugf("codex executor: substituted %d input items with cached compacted history", len(checkpoint.PrefixHashes))
+			}
+		}
+	}
+	if !codexCompactionForced(ctx) {
+		estimate := estimateCodexCompactionTokens(baseModel, body)
+		if estimate <= 0 || estimate < codexCompactionTriggerTokens(e.cfg, baseModel) {
+			return body
+		}
+	}
+	replacement, err := e.runCodexServerCompaction(ctx, auth, from, req, opts, baseModel, body)
+	if err != nil {
+		helps.LogWithRequestID(ctx).Warnf("codex executor: server-side compaction failed, sending input unchanged: %v", err)
+		return body
+	}
+	compacted, ok := helps.ReplaceCodexInputItems(body, replacement)
+	if !ok {
+		return body
+	}
+	if sessionKey != "" {
+		internalcache.CacheCodexCompactionCheckpoint(baseModel, sessionKey, internalcache.CodexCompactionCheckpoint{
+			PrefixHashes: originalHashes,
+			Replacement:  replacement,
+		})
+	}
+	helps.LogWithRequestID(ctx).Infof("codex executor: server-side compaction replaced %d input items with %d compacted items", len(helps.CodexInputItemsRaw(body)), len(replacement))
+	return compacted
+}
+
+// runCodexServerCompaction performs the unary upstream /responses/compact call
+// and returns the replacement history items.
+func (e *CodexExecutor) runCodexServerCompaction(ctx context.Context, auth *cliproxyauth.Auth, from sdktranslator.Format, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string, body []byte) ([][]byte, error) {
+	apiKey, baseURL := codexCreds(auth)
+	if baseURL == "" {
+		baseURL = "https://chatgpt.com/backend-api/codex"
+	}
+	payload := helps.BuildCodexCompactPayload(body)
+	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
+	originalPayloadSource := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayloadSource = opts.OriginalRequest
+	}
+	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, payload, opts.Headers)
+	if err != nil {
+		return nil, err
+	}
+	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
+	applyModelHeaderOverrides(httpReq.Header, baseModel)
+	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	var authID, authLabel, authType, authValue string
+	if auth != nil {
+		authID = auth.ID
+		authLabel = auth.Label
+		authType, authValue = auth.AccountInfo()
+	}
+	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+		URL:       url,
+		Method:    http.MethodPost,
+		Headers:   httpReq.Header.Clone(),
+		Body:      upstreamBody,
+		Provider:  e.Identifier(),
+		AuthID:    authID,
+		AuthLabel: authLabel,
+		AuthType:  authType,
+		AuthValue: authValue,
+	})
+	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	httpResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		return nil, err
+	}
+	defer func() {
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("codex executor: close compaction response body error: %v", errClose)
+		}
+	}()
+	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	data, errRead := io.ReadAll(httpResp.Body)
+	if errRead != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+		return nil, errRead
+	}
+	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		return nil, newCodexStatusErr(httpResp.StatusCode, data)
+	}
+	items, ok := helps.ParseCodexCompactOutput(data)
+	if !ok {
+		return nil, fmt.Errorf("compact endpoint returned no usable replacement history")
+	}
+	return items, nil
+}
+
 func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
@@ -1443,6 +1646,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if errReplay != nil {
 		return nil, errReplay
 	}
+	body = e.applyCodexServerCompaction(ctx, auth, from, req, opts, baseModel, body)
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -1495,6 +1699,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		if e.shouldRetryWithCodexServerCompaction(ctx, from, opts, httpResp.StatusCode, data) {
+			helps.LogWithRequestID(ctx).Infof("codex executor: context window exceeded, retrying once with forced server-side compaction")
+			return e.ExecuteStream(codexWithForcedCompaction(ctx), auth, req, opts)
+		}
 		err = newCodexStatusErr(httpResp.StatusCode, data)
 		return nil, err
 	}

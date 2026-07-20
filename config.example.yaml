@@ -185,6 +185,21 @@ codex:
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
 
+  # Transparent server-side compaction for Codex requests translated from
+  # non-Responses clients (e.g. Claude Code). When the estimated input crosses
+  # the trigger threshold, the proxy calls the upstream /responses/compact
+  # endpoint (the same mechanism the Codex CLI uses) and replaces the oversized
+  # history with the compacted result. Compacted checkpoints are cached
+  # per session so follow-up turns reuse them instead of recompacting.
+  compaction:
+    # Disable automatic server-side compaction.
+    disabled: false
+    # Estimated-input token threshold that triggers compaction.
+    # 0 (default) derives it as 85% of the model context window.
+    trigger-tokens: 0
+    # Context window override used when the registry has no value for a model.
+    context-window: 0
+
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true
 

@@ -285,6 +285,24 @@ type CodexHeaderDefaults struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+
+	// Compaction configures transparent server-side compaction for Codex
+	// requests translated from non-Responses clients (e.g. Claude Code).
+	Compaction CodexCompactionConfig `yaml:"compaction" json:"compaction"`
+}
+
+// CodexCompactionConfig controls automatic upstream /responses/compact calls
+// for conversations approaching the model context window.
+type CodexCompactionConfig struct {
+	// Disabled turns off automatic server-side compaction.
+	Disabled bool `yaml:"disabled" json:"disabled"`
+	// TriggerTokens overrides the estimated-input token threshold that
+	// triggers compaction. When 0, the threshold defaults to 85% of the model
+	// context window.
+	TriggerTokens int `yaml:"trigger-tokens" json:"trigger-tokens"`
+	// ContextWindow overrides the model context window used to derive the
+	// default threshold when the registry has no value for the model.
+	ContextWindow int `yaml:"context-window" json:"context-window"`
 }
 
 // TLSConfig holds HTTPS server settings.
