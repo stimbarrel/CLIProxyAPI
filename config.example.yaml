@@ -195,7 +195,8 @@ codex:
     # Disable automatic server-side compaction.
     disabled: false
     # Estimated-input token threshold that triggers compaction.
-    # 0 (default) derives it as 85% of the model context window.
+    # 0 (default) derives it as 90% of the model context window, matching the
+    # official Codex CLI. Explicit values are clamped to that 90% cap.
     trigger-tokens: 0
     # Context window override used when the registry has no value for a model.
     context-window: 0

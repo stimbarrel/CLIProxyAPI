@@ -1402,9 +1402,9 @@ const (
 	// codexCompactionDefaultContextWindow is used when neither the config nor
 	// the model registry knows the context window for a Codex model.
 	codexCompactionDefaultContextWindow = 258_000
-	// codexCompactionThresholdPercent mirrors the Codex CLI auto-compact limit
-	// (90% of the context window) with extra margin for estimation error.
-	codexCompactionThresholdPercent = 85
+	// codexCompactionThresholdPercent mirrors the Codex CLI auto-compact limit:
+	// 90% of the model context window.
+	codexCompactionThresholdPercent = 90
 )
 
 // codexForcedCompactionKey marks a retry attempt that must compact regardless
@@ -1442,9 +1442,6 @@ func codexCompactionTriggerTokens(cfg *config.Config, baseModel string) int64 {
 	if cfg != nil {
 		compactionCfg = cfg.Codex.Compaction
 	}
-	if compactionCfg.TriggerTokens > 0 {
-		return int64(compactionCfg.TriggerTokens)
-	}
 	contextWindow := int64(compactionCfg.ContextWindow)
 	if contextWindow <= 0 {
 		if info := registry.LookupModelInfo(baseModel, "codex"); info != nil && info.ContextLength > 0 {
@@ -1454,7 +1451,12 @@ func codexCompactionTriggerTokens(cfg *config.Config, baseModel string) int64 {
 	if contextWindow <= 0 {
 		contextWindow = codexCompactionDefaultContextWindow
 	}
-	return contextWindow * codexCompactionThresholdPercent / 100
+	contextLimit := contextWindow * codexCompactionThresholdPercent / 100
+	if compactionCfg.TriggerTokens > 0 {
+		// Mirror Codex: explicit limits are clamped to 90% of the window.
+		return min(int64(compactionCfg.TriggerTokens), contextLimit)
+	}
+	return contextLimit
 }
 
 func estimateCodexCompactionTokens(baseModel string, body []byte) int64 {

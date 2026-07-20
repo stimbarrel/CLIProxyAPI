@@ -297,8 +297,9 @@ type CodexCompactionConfig struct {
 	// Disabled turns off automatic server-side compaction.
 	Disabled bool `yaml:"disabled" json:"disabled"`
 	// TriggerTokens overrides the estimated-input token threshold that
-	// triggers compaction. When 0, the threshold defaults to 85% of the model
-	// context window.
+	// triggers compaction. When 0, the threshold defaults to 90% of the model
+	// context window (Codex CLI parity); explicit values are clamped to that
+	// 90% cap.
 	TriggerTokens int `yaml:"trigger-tokens" json:"trigger-tokens"`
 	// ContextWindow overrides the model context window used to derive the
 	// default threshold when the registry has no value for the model.
